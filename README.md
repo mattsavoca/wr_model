@@ -7,7 +7,7 @@ The goal of this project is to use the tidymodels interface in R to
 predict a “breakout WR” - without using their draft stock, a notoriously
 difficult task. A breakout WR will be defined as any player who
 eventually completes a top-24 PPR season (or better) or two (2) top-36
-season in the NFL. We will use a dataset going back to only 20212, but
+season in the NFL. We will use a dataset going back to only 2012, but
 one that has had thousands of features added (through many of them are
 aggregations) already.
 
@@ -595,7 +595,7 @@ Tons more to do here as well.
 
 ![](WR_model_html_files/figure-markdown_strict/unnamed-chunk-23-1.png)
 
-Make predictions using XGBoost
+Make predictions using SVC
 ------------------------------
 
 Because there has been no hyperparameter tuning, these results will
