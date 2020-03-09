@@ -1,0 +1,477 @@
+---
+title: "WR Model 2020"
+author: "Matt Savoca"
+date: "3/9/2020"
+output: pdf_document
+---
+#Predicting WR Value
+
+## Intro
+The goal of this project is to use the tidymodels interface in R to predict a "breakout WR" - without using their draft stock, a notoriously difficult task. A breakout WR will be defined as any player who eventually completes a top-24 PPR season (or better) or two (2) top-36 season in the NFL. We will use a dataset going back to only 20212, but one that has had thousands of features added (through many of them are aggregations) already.
+
+Because many of the features are aggregations of others, we will be dealing with highly correlated data, which indicates that Principal Component Analysis could be useful, particularly for linear models
+
+## Load Packages
+```{r warning=FALSE, message = FALSE}
+#devtools::install_github("jakesherman/easypackages")
+library(easypackages)
+
+wr_model_packages = c(
+  #Data Import and Data Processing
+  "googlesheets4", "tidyverse", "dtplyr","data.table", "lubridate",
+   "janitor",
+  
+  #Data Exploration
+  "GGally", "skimr",
+  
+  #Modelling Workflow
+  "tidymodels",
+  
+  #Model Types
+  "ranger", "rpart", "xgboost","kknn", "performance","xgboost","keras", "glmnet", "randomForest","kernlab",
+  
+  #validation and cleanup
+  "workflows", "tune"
+  )
+
+#check for package installation
+packages(wr_model_packages, prompt = T)
+
+#load all packages
+libraries(wr_model_packages)
+
+```
+
+
+## Get Data
+
+Let's also clean some of the names using the janitor package (this creates a few problems, which we'll fix with gsub())
+
+```{r warning=FALSE, message = FALSE}
+WR_data = read_csv("~/Dropbox/Matt Savoca/Projects/WRmodel_2020/02 - Prepared Data/WR.csv")
+
+WR_data = WR_data %>%
+  clean_names()
+
+colnames(WR_data) = gsub("t_d", "td", colnames(WR_data))
+colnames(WR_data) = gsub("w_rs", "wrs", colnames(WR_data))
+colnames(WR_data) = gsub("at_ts", "atts", colnames(WR_data))
+colnames(WR_data) = gsub("re_cs", "rec", colnames(WR_data))
+colnames(WR_data) = gsub("f_inishes", "finishes", colnames(WR_data))
+```
+
+
+
+## Data Wrangling
+
+First we'll ensure columns are the right dtype, and then we'll begin the process of using "Year-based" metrics instead of "Age-based" nmetrics as the dataset has.
+
+```{r warning = FALSE, message = FALSE}
+WR_pivot = WR_data %>%
+  # Adjust Table so that each player-season has it's own row
+  select(-contains("over"),-contains("ovr"), -contains("breakout")) %>%
+  mutate_at(vars(matches("age_[0-9+]")), funs(as.numeric)) %>%
+  mutate_at(vars(matches("career_")), funs(as.numeric)) %>%
+  mutate_at(vars(matches("dominator_")), funs(as.numeric)) %>%
+  mutate_at(vars(matches("vertical")), funs(as.numeric)) %>%
+  pivot_longer(
+    cols = contains("_age_", ignore.case = F),
+    names_to = c("metric", "age"),
+    names_pattern = "([a-zA-Z/_]*)age_([1-2+][0-9+])",
+    names_ptypes = list(metric = character(),
+                        age = integer()),
+    ) %>% 
+  pivot_wider(names_from = metric, values_from = value)
+```
+
+
+
+Next we'll use the dplyr package to clean the data, generate a few more features, and create our target variable, **wr_type**. A value of "Yes" indicates a breakout, and "No" indicates no breakout. We'll also ensure the dataset only includes one line per player.
+
+
+
+```{r warning = FALSE, message = FALSE}
+WR_df = WR_pivot %>%
+  mutate(
+    # Keep the Bama info
+    is_alabama = case_when(school == "Alabama" ~ 1, TRUE ~ 0),
+    # Keep the OSU info
+    is_osu = case_when(school == "Ohio ST" ~ 1, TRUE ~ 0),
+    
+    #keep the power 5 info
+    #is_p5 = case_when(
+    #  conf %in% c('Big 12', 'Pac-12', 'SEC', 'Big Ten', 'ACC') ~ 1,
+    #  TRUE ~ 0),
+    
+    
+    # numericals to factors
+    draft_age = factor(draft_age),
+    draft_year = factor(draft_year),
+    
+    # UDFA to column
+    is_udfa = case_when(draft_round == "UDFA" ~ 1, TRUE ~ 0),
+    
+    # FF thresholds
+    top_36 = case_when(nfl_finishes_top_36_wr > 0 ~ 1, TRUE ~ 0),
+    top_24 = case_when(nfl_finishes_top_24_wr > 0 ~ 1, TRUE ~ 0),
+    top_12 = case_when(nfl_finishes_top_12_wr > 0 ~ 1, TRUE ~ 0),
+    
+    # Kind of unneccessary, since we'll drop for now
+    draft_round = as.numeric(draft_round),
+    draft_pick= as.numeric(draft_pick),
+    
+    # TARGET VARIABLE
+    wr_type = factor(case_when(
+      top_12 > 0 | top_24 > 0 | 
+        top_36 > 1 ~ "Yes", TRUE ~ "No")),
+    
+    draft_day = factor(case_when(draft_round < 2 ~ 1,
+                          draft_round < 4 ~ 2,
+                          draft_round < 8 ~ 3,
+                          is_udfa == 1 ~ 4,
+                          TRUE ~ NA_real_)),
+  ) %>% # Step 2 begins...
+  filter(is.na(games_played_)==F) %>%
+  
+  # ONE LINE PER PLAYER 
+  group_by(player, school, draft_age) %>%
+  mutate(min_age = min(age),
+         max_age = max(age),
+         year = age-min_age + 1,
+         draft_round = factor(draft_round),
+         draft_pick= factor(draft_pick)
+         ) %>%
+  pivot_longer(
+    cols = ends_with("_"),
+    names_to = "key"
+  ) %>%
+  mutate(key = paste0(key, "year_", year),
+         age = factor(age)) %>%
+  ungroup() %>%
+  
+  
+  # create new "Year-based" (rather than age-based) metrics
+  # wider is better for typical linear models
+  pivot_wider(names_from = key, values_from = value) %>%
+  group_by(player, school, draft_year) %>%
+  mutate_if(is.numeric, mean, na.rm = T) %>%
+  mutate(draft_age_date = mdy(paste0("9/1/", draft_year)),
+         dob = mdy(dob),
+         draft_age = as.numeric((draft_age_date - dob)/365.25),
+         draft_day = as.numeric(draft_day)) %>%
+  filter(as.numeric(as.character(age)) == as.numeric(as.character(max_age))) %>%
+  ungroup()
+```
+
+
+
+## Explore Data
+
+I'll go much faster than I ever would in real-life here, since I wanna get to the modeling. A shortcut is to use the `skimm()` frunction within the `skimmr` package.
+
+
+### Filter unused columns
+```{r warning=FALSE, message = FALSE}
+WR_filtered = WR_df %>%
+  filter(as.numeric(as.character(draft_year)) < 2020) %>%
+  select(-draft_year, -top_12, -top_36, -matches("finishes"), 
+         -age, -player, -school, -draft_round, -draft_pick, -draft_age, 
+         -draft_age_date, -dob, -draft_day)
+```
+
+### Explore - will comment out as image is quite large
+```{r}
+#skimr::skim(WR_filtered)
+```
+
+
+
+## Model Setup
+
+```{r, warning=FALSE, message=FALSE}
+WR_split = initial_split(WR_filtered)
+WR_train = training(WR_split)
+WR_test = testing(WR_split)
+
+# df for 2020 WRs
+WR_prediction_df = WR_df %>%
+  filter(as.numeric(as.character(draft_year)) == 2020)
+
+WR_thisyear = WR_prediction_df %>%
+  select(-draft_year, -top_12, -top_36, -matches("finishes"), 
+         -age, -player, -school, -draft_round, -draft_pick, -draft_age, 
+         -draft_age_date, -dob, -draft_day)
+```
+
+### Preprocess via `recipes`
+
+An important step, alongside PCA is normalizing the numerical metrics, and donwsampling wr_type so that the training data includes the as many breakout WRs as busts (non-breakout.)
+
+```{r, warning=FALSE, message=FALSE}
+WR_rec = recipe(wr_type ~ ., data = WR_train) %>%
+  step_meanimpute(all_numeric()) %>%
+  step_modeimpute(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_numeric()) %>%
+  step_corr(all_numeric()) %>%
+  step_downsample(wr_type) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_normalize(all_numeric()) %>%
+  step_pca(all_predictors()) %>%
+  prep()
+```
+
+```{r}
+train_proc = recipes::bake(WR_rec, new_data = WR_train)
+test_proc = recipes::bake(WR_rec, new_data = WR_test)
+val_proc = recipes::bake(WR_rec, new_data = WR_thisyear)
+```
+
+
+Our modeling dataset now looks nothing like our original, and includes the same amount of No and Yes in our target variable.
+```{r}
+table(juice(WR_rec)$wr_type)
+```
+
+
+## Begin Modelling
+
+We'll use the models (essentially) out-of-the-box. Each model should have it's hyperparamters tuned significantly before finializing results, but getting the results is what's fun ¯\_(ツ)_/¯
+
+### KNN Model
+
+```{r}
+knn_spec = nearest_neighbor(neighbors = 3) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+
+knn_fit = knn_spec %>%
+  fit(wr_type ~ .,
+      data = juice(WR_rec))
+  
+knn_fit
+```
+
+### Decision Tree Model
+
+```{r}
+tree_spec = decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_fit = tree_spec %>%
+  fit(wr_type ~ .,
+      data = juice(WR_rec))
+
+tree_fit
+```
+
+### GLM (Generalized Linear Model)
+
+```{r}
+# GLM Classification Model ####
+glm_spec = logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+glm_fit = glm_spec %>%
+  fit(wr_type ~ .,
+      data = juice(WR_rec))
+
+glm_fit
+```
+
+
+### Random Forest Model (Decision Trees w/ Resampling)
+
+```{r}
+rf_spec = rand_forest() %>%
+  set_engine("randomForest") %>%
+  set_mode("classification")
+
+rf_fit = rf_spec %>%
+  fit(wr_type ~ .,
+      data = juice(WR_rec))
+
+rf_fit
+```
+
+### XGBoost (Extreme Gradient Boosted Trees) Model
+
+```{r}
+xgb_spec = boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_fit = xgb_spec %>%
+  fit(wr_type ~ .,
+      data = juice(WR_rec))
+
+xgb_fit
+
+```
+
+### SVC (Support Vector Classifier)
+
+```{r}
+svm_spec = svm_poly() %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+svm_fit = svm_spec %>%
+  fit(wr_type ~ .,
+      data = juice(WR_rec))
+
+svm_fit
+```
+
+
+## (Brief) Cross-Validation 
+
+Here we use Monte Carlo Cross-Validation with `mc_cv()` function. We'll pay careful attention to the ROC_AUC metric (higher is better, but values very clsoe to 1 may indicate overfitting or data leakage)
+
+
+### KNN
+```{r}
+validation_splits = mc_cv(juice(WR_rec), prop = 0.9, strata = wr_type)
+
+
+
+knn_res = fit_resamples(
+  wr_type ~ .,
+  knn_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+knn_res %>%
+  collect_metrics()
+```
+
+### GLM
+
+```{r}
+glm_res = fit_resamples(
+  wr_type ~ .,
+  glm_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+glm_res %>%
+  collect_metrics()
+
+```
+
+
+### Decision Tree
+```{r}
+tree_res = fit_resamples(
+  wr_type ~ .,
+  tree_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+tree_res %>%
+  collect_metrics()
+```
+
+### Random Forest
+```{r}
+rf_res = fit_resamples(
+  wr_type ~ .,
+  rf_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+rf_res %>%
+  collect_metrics()
+```
+
+
+### XGBoost
+```{r}
+xgb_res = fit_resamples(
+  wr_type ~ .,
+  xgb_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+xgb_res %>%
+  collect_metrics()
+
+```
+
+### SVC
+
+```{r}
+svm_res = fit_resamples(
+  wr_type ~ .,
+  svm_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+svm_res %>%
+  collect_metrics()
+```
+
+
+
+
+## Evaluate Models
+
+Tons more to do here as well.
+
+### Generate ROC curve
+```{r}
+rf_res %>%
+  unnest(.predictions) %>%
+  mutate(model = "rf") %>%
+  bind_rows(tree_res %>%
+              unnest(.predictions) %>%
+              mutate(model = "tree")) %>%
+  bind_rows(xgb_res %>%
+              unnest(.predictions) %>%
+              mutate(model = "xgb")) %>%
+  bind_rows(glm_res %>%
+              unnest(.predictions) %>%
+              mutate(model = "glm")) %>%
+  bind_rows(knn_res %>%
+              unnest(.predictions) %>%
+              mutate(model = "knn")) %>%
+  bind_rows(svm_res %>%
+              unnest(.predictions) %>%
+              mutate(model = "svc")) %>%
+  group_by(model) %>%
+  #generate ROC curve
+  yardstick::roc_curve(wr_type, .pred_Yes) %>%
+  
+  #other charts
+  #yardstick::pr_curve(wr_type, .pred_Yes) %>%
+  #yardstick::gain_curve(wr_type, .pred_Yes) %>%
+  
+  #plot ROC curve with autoplot()
+  autoplot()
+```
+
+
+## Make predictions using XGBoost
+
+Because there has been no hyperparameter tuning, these results will still be different with each run, so they're just for fun. We can always standardied results by using the `set.seed()` function.
+
+
+```{r}
+predictions = svm_fit %>%
+  predict(new_data = val_proc, type = "prob") %>%
+  bind_cols(WR_prediction_df)
+
+
+predictions %>% arrange(-.pred_Yes) %>% select(
+  .pred_Yes, player, school, conf
+)
+```
+
